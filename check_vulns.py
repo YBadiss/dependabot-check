@@ -23,12 +23,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List
 from dataclasses import dataclass
 import subprocess
 import shutil
+import urllib.request
+import urllib.error
 
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version, InvalidVersion
@@ -64,9 +67,11 @@ def _is_version_vulnerable(version_str: str, vulnerable_range: str) -> bool:
     spec = SpecifierSet(_normalize_specifier(vulnerable_range))
     return version in spec
 
+
 # ---------------------------------------------------------------------------
 # Helpers for automatic installed-version collection
 # ---------------------------------------------------------------------------
+
 
 def _detect_and_collect_installed() -> Dict[str, str]:
     """Detect repository type and return mapping of installed packages."""
@@ -75,16 +80,12 @@ def _detect_and_collect_installed() -> Dict[str, str]:
 
     # Order of preference: Node, Go, Python (you can adjust)
     if (cwd / "package.json").exists():
-        print("Detected Node repository")
         return _collect_node_packages()
 
     if (cwd / "go.mod").exists():
-        print("Detected Go repository")
         return _collect_go_modules()
 
-    # Default to Python
-    print("Detected Python repository")
-    return _collect_python_packages()
+    raise RuntimeError("No repository type detected")
 
 
 def _collect_node_packages() -> Dict[str, str]:
@@ -105,7 +106,9 @@ def _collect_node_packages() -> Dict[str, str]:
 
     npm_cmd = shutil.which("npm")
     if npm_cmd is None:
-        sys.exit("[error] Detected Node repository but 'npm' command not found in PATH.")
+        sys.exit(
+            "[error] Detected Node repository but 'npm' command not found in PATH."
+        )
 
     try:
         result = subprocess.run(
@@ -138,26 +141,6 @@ def _collect_node_packages() -> Dict[str, str]:
         sys.exit(f"[error] Failed to run npm ls: {exc}")
 
 
-def _collect_python_packages() -> Dict[str, str]:
-    """Return {package: version} for currently installed Python packages."""
-
-    pip_cmd = shutil.which("pip") or shutil.which("pip3")
-    if pip_cmd is None:
-        sys.exit("[error] 'pip' not found; cannot list Python packages.")
-
-    try:
-        result = subprocess.run(
-            [pip_cmd, "list", "--format", "json"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        pkgs = json.loads(result.stdout)
-        return {pkg["name"].lower(): pkg["version"] for pkg in pkgs}
-    except subprocess.CalledProcessError as exc:
-        sys.exit(f"[error] Failed to run pip list: {exc}")
-
-
 def _collect_go_modules() -> Dict[str, str]:
     """Return {module: version} for Go modules in the current repo."""
 
@@ -184,9 +167,11 @@ def _collect_go_modules() -> Dict[str, str]:
     except subprocess.CalledProcessError as exc:
         sys.exit(f"[error] Failed to run go list: {exc}")
 
+
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
+
 
 @dataclass(slots=True)
 class AlertInfo:
@@ -224,7 +209,9 @@ class AlertInfo:
         )
 
 
-def filter_alerts(alerts: List[AlertInfo], installed: Dict[str, str]) -> List[AlertInfo]:
+def filter_alerts(
+    alerts: List[AlertInfo], installed: Dict[str, str]
+) -> List[AlertInfo]:
     """Return subset of *alerts* that match criteria defined in README."""
     filtered: List[AlertInfo] = []
 
@@ -256,9 +243,8 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Filter Dependabot alerts.")
     parser.add_argument(
         "--dependabot",
-        required=True,
         type=Path,
-        help="Path to Dependabot alerts JSON file.",
+        help="Path to Dependabot alerts JSON file. If omitted, the script attempts to fetch alerts from GitHub.",
     )
     parser.add_argument(
         "--installed",
@@ -276,9 +262,14 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
 def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
 
-    alerts = [AlertInfo.from_raw(alert) for alert in _load_json(args.dependabot)]
+    if args.dependabot:
+        alerts = [AlertInfo.from_raw(alert) for alert in _load_json(args.dependabot)]
+    else:
+        alerts = [
+            AlertInfo.from_raw(alert)
+            for alert in _fetch_dependabot_alerts_from_github()
+        ]
 
-    print("Collecting installed versions...")
     if args.installed:
         installed = _load_json(args.installed)
     else:
@@ -291,6 +282,68 @@ def main(argv: List[str] | None = None) -> None:
     else:
         json.dump(filtered, sys.stdout, indent=2)
         sys.stdout.write("\n")
+
+
+def _fetch_dependabot_alerts_from_github() -> list[dict[str, Any]]:
+    """Fetch open Dependabot alerts using the GitHub API.
+
+    Environment variables required:
+      GH_TOKEN – a GitHub personal access token with `security_events:read` scope
+      GH_REPO  – the repository in `owner/name` form
+
+    The function first tries to invoke the `gh` CLI (preferred for simplicity).
+    If `gh` is not available, it falls back to a direct HTTPS request using the
+    token. In either case, it returns the parsed JSON list of alert objects or
+    terminates the program with a descriptive error.
+    """
+
+    repo = os.environ.get("GH_REPO")
+    token = os.environ.get("GH_TOKEN")
+
+    if not repo:
+        sys.exit("[error] GH_REPO environment variable not set (e.g. 'owner/repo').")
+    if not token:
+        sys.exit("[error] GH_TOKEN environment variable not set.")
+
+    # 1) Try GitHub CLI ------------------------------------------------------
+    gh_cmd = shutil.which("gh")
+    if gh_cmd is not None:
+        try:
+            result = subprocess.run(
+                [
+                    gh_cmd,
+                    "api",
+                    f"/repos/{repo}/dependabot/alerts",
+                    "--method",
+                    "GET",
+                    "--field",
+                    "state=open",
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return json.loads(result.stdout)
+        except subprocess.CalledProcessError as exc:
+            print(
+                f"[warn] Failed to fetch alerts via gh CLI (will retry via HTTPS): {exc}",
+                file=sys.stderr,
+            )
+
+    # 2) Fallback to raw HTTP request ---------------------------------------
+    url = f"https://api.github.com/repos/{repo}/dependabot/alerts?state=open"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "dependabot-check-script",
+    }
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"[error] Failed to fetch alerts via HTTPS: {exc}")
 
 
 if __name__ == "__main__":
