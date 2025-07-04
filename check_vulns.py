@@ -322,6 +322,7 @@ def _fetch_dependabot_alerts_from_github() -> list[dict[str, Any]]:
                 capture_output=True,
                 text=True,
                 check=True,
+                env=os.environ.copy(),
             )
             return json.loads(result.stdout)
         except subprocess.CalledProcessError as exc:
