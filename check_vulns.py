@@ -27,6 +27,8 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List
 from dataclasses import dataclass
+import subprocess
+import shutil
 
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version, InvalidVersion
@@ -62,11 +64,99 @@ def _is_version_vulnerable(version_str: str, vulnerable_range: str) -> bool:
     spec = SpecifierSet(_normalize_specifier(vulnerable_range))
     return version in spec
 
+# ---------------------------------------------------------------------------
+# Helpers for automatic installed-version collection
+# ---------------------------------------------------------------------------
+
+def _detect_and_collect_installed() -> Dict[str, str]:
+    """Detect repository type and return mapping of installed packages."""
+
+    cwd = Path.cwd()
+
+    # Order of preference: Node, Go, Python (you can adjust)
+    if (cwd / "package.json").exists():
+        print("Detected Node repository")
+        return _collect_node_packages()
+
+    if (cwd / "go.mod").exists():
+        print("Detected Go repository")
+        return _collect_go_modules()
+
+    # Default to Python
+    print("Detected Python repository")
+    return _collect_python_packages()
+
+
+def _collect_node_packages() -> Dict[str, str]:
+    """Return {package: version} for top-level npm dependencies."""
+
+    npm_cmd = shutil.which("npm")
+    if npm_cmd is None:
+        sys.exit("[error] Detected Node repository but 'npm' command not found in PATH.")
+
+    try:
+        result = subprocess.run(
+            [npm_cmd, "ls", "--json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        data = json.loads(result.stdout)
+        deps = data.get("dependencies", {})
+        return {name: info.get("version", "") for name, info in deps.items()}
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"[error] Failed to run npm ls: {exc}")
+
+
+def _collect_python_packages() -> Dict[str, str]:
+    """Return {package: version} for currently installed Python packages."""
+
+    pip_cmd = shutil.which("pip") or shutil.which("pip3")
+    if pip_cmd is None:
+        sys.exit("[error] 'pip' not found; cannot list Python packages.")
+
+    try:
+        result = subprocess.run(
+            [pip_cmd, "list", "--format", "json"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        pkgs = json.loads(result.stdout)
+        return {pkg["name"].lower(): pkg["version"] for pkg in pkgs}
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"[error] Failed to run pip list: {exc}")
+
+
+def _collect_go_modules() -> Dict[str, str]:
+    """Return {module: version} for Go modules in the current repo."""
+
+    go_cmd = shutil.which("go")
+    if go_cmd is None:
+        sys.exit("[error] Detected Go repository but 'go' command not found in PATH.")
+
+    try:
+        result = subprocess.run(
+            [go_cmd, "list", "-m", "-f", "{{.Path}} {{.Version}}", "all"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        mapping: Dict[str, str] = {}
+        for line in result.stdout.strip().splitlines():
+            if not line.strip():
+                continue
+            # Each line: 'path version'
+            parts = line.split()
+            if len(parts) >= 2:
+                mapping[parts[0]] = parts[1]
+        return mapping
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"[error] Failed to run go list: {exc}")
 
 # ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
-
 
 @dataclass(slots=True)
 class AlertInfo:
@@ -142,9 +232,8 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--installed",
-        required=True,
         type=Path,
-        help="Path to JSON mapping of installed package versions.",
+        help="Path to JSON file with installed package versions. If omitted, the script attempts to autodetect the current repository type (Python, Node, or Go) and gather installed versions automatically.",
     )
     parser.add_argument(
         "--output",
@@ -158,7 +247,12 @@ def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
 
     alerts = [AlertInfo.from_raw(alert) for alert in _load_json(args.dependabot)]
-    installed = _load_json(args.installed)
+
+    print("Collecting installed versions...")
+    if args.installed:
+        installed = _load_json(args.installed)
+    else:
+        installed = _detect_and_collect_installed()
 
     filtered = filter_alerts(alerts, installed)
 
@@ -170,4 +264,4 @@ def main(argv: List[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main() 
+    main()

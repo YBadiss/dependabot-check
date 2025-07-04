@@ -32,6 +32,15 @@ uv tool install "dependabot-check @ git+https://github.com/YBadiss/dependabot-ch
 
 to install the checker as a standalone script that can be run using `dependabot-check ...`.
 
+If you prefer the classic Python tooling stack, install with **pip** (adds the
+entry-point to `~/.local/bin` on most systems):
+
+```bash
+python3 -m pip install --user dependabot-check
+# or, for an isolated virtual env + PATH shim:
+pipx install dependabot-check
+```
+
 ### 2. Run the vulnerability check
 
 Simply point the script at the Dependabot JSON export and a JSON map of the
