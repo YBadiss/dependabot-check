@@ -88,7 +88,20 @@ def _detect_and_collect_installed() -> Dict[str, str]:
 
 
 def _collect_node_packages() -> Dict[str, str]:
-    """Return {package: version} for top-level npm dependencies."""
+    """Return a mapping of *all* (top-level and transitive) npm dependencies.
+
+    The implementation mirrors the behavior of the following jq one-liner provided
+    by the user, but is implemented directly in Python to remove the jq runtime
+    requirement:
+
+        npm ls --all --json \
+          | jq '<recursive function shown in user message>'
+
+    We invoke `npm ls --all --json` to obtain the full dependency tree and then
+    traverse it recursively, collecting each package's declared version. The
+    resulting dictionary uses lower-cased package names to match the
+    normalisation applied elsewhere in this script (e.g. Python packages).
+    """
 
     npm_cmd = shutil.which("npm")
     if npm_cmd is None:
@@ -96,14 +109,31 @@ def _collect_node_packages() -> Dict[str, str]:
 
     try:
         result = subprocess.run(
-            [npm_cmd, "ls", "--json"],
+            [npm_cmd, "ls", "--all", "--json"],
             capture_output=True,
             text=True,
             check=True,
         )
+
         data = json.loads(result.stdout)
-        deps = data.get("dependencies", {})
-        return {name: info.get("version", "") for name, info in deps.items()}
+
+        def _walk(dep_tree: Dict[str, Any] | None, mapping: Dict[str, str]) -> None:
+            """Recursively traverse *dep_tree*, filling *mapping* in-place."""
+
+            if not dep_tree:
+                return
+
+            for pkg_name, info in dep_tree.items():
+                version = info.get("version")
+                if version:
+                    mapping[pkg_name.lower()] = version
+
+                # Recurse into nested dependencies, if any
+                _walk(info.get("dependencies"), mapping)
+
+        collected: Dict[str, str] = {}
+        _walk(data.get("dependencies"), collected)
+        return collected
     except subprocess.CalledProcessError as exc:
         sys.exit(f"[error] Failed to run npm ls: {exc}")
 
