@@ -284,7 +284,7 @@ def main(argv: List[str] | None = None) -> None:
     else:
         installed = _detect_and_collect_installed()
 
-    filtered = filter_alerts(alerts, installed)
+    filtered = [alert.source for alert in filter_alerts(alerts, installed)]
 
     if args.output:
         args.output.write_text(json.dumps(filtered, indent=2))
