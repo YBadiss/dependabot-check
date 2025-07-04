@@ -1,0 +1,5 @@
+{
+    "django": "2.0.2",
+    "ansible": "2.9.1",
+    "something-else": "2.8.1"
+}
