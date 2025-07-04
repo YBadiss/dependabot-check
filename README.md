@@ -1,91 +1,86 @@
-## Usage
+# dependabot-check
 
-This repository includes a standalone script **`check_vulns.py`** (located at the
-project root). The script is completely self-contained and declares its own
-runtime requirements via *inline* metadata that `uv` understands, so **there is
-no separate `requirements.txt` or virtual-environment setup needed**.
+A lightweight utility that filters Dependabot alerts so you only see **open** vulnerabilities that are **high/critical _and_ still installed** in your project.
 
-### 1. Installation
+The script is self-contained and declares its single runtime dependency inline, so you can run it with nothing but `uv` (or plain `python`).
 
-`uv` is a modern, ultra-fast package & project manager written in Rust. Install
-it once and reuse it across all your Python projects:
+---
+
+## Installation
 
 ```bash
-# macOS (Homebrew)
+# Homebrew (macOS) – recommended
 brew install uv
 
-# Or, platform-agnostic install script
+# Or universal install script
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-Verify the installation:
+Run directly from the repo:
 
 ```bash
-uv --version
+uv run check_vulns.py [options]
 ```
 
-You can then run
+Or install globally as a CLI:
 
 ```bash
 uv tool install "dependabot-check @ git+https://github.com/YBadiss/dependabot-check"
 ```
 
-to install the checker as a standalone script that can be run using `dependabot-check ...`.
+---
 
-If you prefer the classic Python tooling stack, install with **pip** (adds the
-entry-point to `~/.local/bin` on most systems):
+## Usage
+
+### Minimal – fully automatic
 
 ```bash
-python3 -m pip install --user dependabot-check
-# or, for an isolated virtual env + PATH shim:
-pipx install dependabot-check
+# GH_TOKEN and GH_REPO must be set (see below)
+dependabot-check
 ```
 
-### 2. Run the vulnerability check
+Behaviour:
+1. Fetches all **open** Dependabot alerts for `$GH_REPO` using the GitHub API.
+2. Detects the project type (Node, Go, or Python) and gathers installed versions.
+3. Prints a JSON array of actionable alerts to STDOUT.
 
-Simply point the script at the Dependabot JSON export and a JSON map of the
-currently installed package versions:
+### Explicit file input
 
 ```bash
-uv run check_vulns.py \
-  --dependabot dependabot_output_example.json \
-  --installed installed_versions_example.json \
+dependabot-check \
+  --dependabot dependabot_alerts.json \
+  --installed installed_versions.json \
   --output vulns_to_fix.json
 ```
 
-The script will:
+### Command-line reference
 
-1. Create (or reuse) an isolated virtual environment managed by `uv`.
-2. Install the single runtime dependency (`packaging`) declared inside the
-   script itself.
-3. Filter the Dependabot alerts such that **only** vulnerabilities that meet
-   all **three** criteria remain:
+| Option         | Required? | Description                                                               |
+|----------------|-----------|---------------------------------------------------------------------------|
+| `--dependabot` | optional  | Path to Dependabot alerts export. If omitted the script fetches alerts via the GitHub API, which requires `GH_TOKEN` & `GH_REPO`. |
+| `--installed`  | optional  | JSON mapping of `<package>: <version>`. If omitted the script auto-detects the repository type and collects versions itself. |
+| `--output`     | optional  | Write filtered alerts to this file instead of STDOUT.                     |
 
-   - alert **state** is `open`
-   - **severity** is `high` or `critical`
-   - the vulnerable package **version** is **still installed** in the local
-     environment
+---
 
-4. Write the resulting list to `vulns_to_fix.json` (or `STDOUT` if
-   `--output` is omitted).
+## Environment variables (for API fetch)
 
-### 3. Automating in CI / shell scripts
+| Variable   | Description                                    |
+|------------|------------------------------------------------|
+| `GH_TOKEN` | GitHub token with `security_events:read` scope. |
+| `GH_REPO`  | Repository in `owner/name` form.               |
 
-You can wire the tool into a Bash conditional to **fail** a pipeline when
-critical/high vulnerabilities are still present:
+If the GitHub CLI (`gh`) is available the script will prefer it; otherwise it falls back to a raw HTTPS request.
+
+---
+
+## CI example – fail pipeline on remaining vulns
 
 ```bash
-#!/usr/bin/env bash
 set -euo pipefail
 
-# Assuming the JSON files are already generated in your CI workspace
-alerts_json=dependabot_alerts.json
-installed_json=installed_versions.json
-
-# Count how many actionable vulns remain
-vuln_count=$(dependabot-check \
-  --dependabot "$alerts_json" \
-  --installed "$installed_json" | jq 'length')
+# Fetch alerts directly via API and let the script auto-detect installed pkgs
+vuln_count=$(dependabot-check | jq 'length')
 
 if [ "$vuln_count" -gt 0 ]; then
   echo "❌ $vuln_count unresolved high/critical vulnerabilities detected!"
@@ -95,59 +90,34 @@ else
 fi
 ```
 
-Explanation:
+---
 
-* `dependabot-check` outputs a JSON array of the remaining alerts.
-* `jq 'length'` returns the number of elements in that array.
-* The script exits with **non-zero** status when vulnerabilities remain, causing
-  the CI job to fail.
+## Manual helpers for `--installed`
 
-If you don't have `jq` available, you could use a simple `grep` fallback:
+If you prefer to supply `--installed` yourself, here are handy one-liners that produce the expected JSON object:
 
-```bash
-if dependabot-check --dependabot "$alerts_json" --installed "$installed_json" | grep -q "\["; then
-  echo "vulnerabilities present"
-  exit 1
-fi
-```
-
-### 4. Generating `installed_versions.json`
-
-`dependabot-check` expects a simple JSON object mapping **package names → version strings**. Below are reference commands for the most common ecosystems. Each pipe uses `jq` to transform the tool's native JSON into the required flat object.
-
-> Feel free to adjust depth flags (`--depth`) or filters depending on your repo layout.
-
-#### a. Python (pip / uv)
+### Python (pip / uv)
 
 ```bash
-# Using uv (preferred – falls back to pip under the hood)
 uv pip list --format=json \
-  | jq -r 'map({ (.name): .version }) | add' \
+  | jq -r 'map({ (.name): .version }) | add' > installed_versions.json
+```
+
+### Node (npm)
+
+```bash
+npm ls --all --json \
+  | jq 'def rec: (.dependencies? // {}) | to_entries | map({ (.key): .value.version } + (.value | rec)) | add; rec' \
   > installed_versions.json
 ```
 
-#### b. npm (JavaScript / TypeScript)
+### Go modules
 
 ```bash
-# Capture only top-level production deps; omit --depth=0 to include transitive ones
-npm ls --json --depth=0 \
-  | jq '.dependencies | map_values(.version)' \
-  > installed_versions.json
-```
-
-If you're using **pnpm** or **yarn**:
-
-```bash
-pnpm list --json --depth=0 | jq '.[0].dependencies | map_values(.version)' > installed_versions.json
-```
-
-#### c. Go modules
-
-```bash
-# Collect all modules (main + dependencies)
 go list -m -json all \
-  | jq -s 'map({ (.Path): .Version }) | add' \
-  > installed_versions.json
+  | jq -s 'map({ (.Path): .Version }) | add' > installed_versions.json
 ```
 
-Once you have the file, run the checker as shown earlier.
+---
+
+Made with ❤️ to keep your dependencies healthy.
