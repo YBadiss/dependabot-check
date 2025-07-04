@@ -1,9 +1,3 @@
-Python script using `uv` that uses Dependabot's output + a list of installed packages to conclude if any vulnerabilities are being fixed.
-
-- the vulns must be `open`
-- the vulns must be `critical` or `high`
-- output a new list of the vulns that are in the dependabot output, and still present in the installed versions
-
 ## Usage
 
 This repository includes a standalone script **`check_vulns.py`** (located at the
@@ -11,7 +5,7 @@ project root). The script is completely self-contained and declares its own
 runtime requirements via *inline* metadata that `uv` understands, so **there is
 no separate `requirements.txt` or virtual-environment setup needed**.
 
-### 1. Install `uv`
+### 1. Installation
 
 `uv` is a modern, ultra-fast package & project manager written in Rust. Install
 it once and reuse it across all your Python projects:
@@ -29,6 +23,14 @@ Verify the installation:
 ```bash
 uv --version
 ```
+
+You can then run
+
+```bash
+uv tool install "dependabot-check @ git+https://github.com/YBadiss/dependabot-check"
+```
+
+to install the checker as a standalone script that can be run using `dependabot-check ...`.
 
 ### 2. Run the vulnerability check
 
@@ -58,15 +60,85 @@ The script will:
 4. Write the resulting list to `vulns_to_fix.json` (or `STDOUT` if
    `--output` is omitted).
 
-### 3. Make it executable (optional)
+### 3. Automating in CI / shell scripts
 
-If you prefer a direct command (no `uv run` prefix), give the file an executable
-bit and call it like any regular CLI tool:
+You can wire the tool into a Bash conditional to **fail** a pipeline when
+critical/high vulnerabilities are still present:
 
 ```bash
-chmod +x check_vulns.py
-./check_vulns.py --dependabot my_alerts.json --installed my_versions.json
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Assuming the JSON files are already generated in your CI workspace
+alerts_json=dependabot_alerts.json
+installed_json=installed_versions.json
+
+# Count how many actionable vulns remain
+vuln_count=$(dependabot-check \
+  --dependabot "$alerts_json" \
+  --installed "$installed_json" | jq 'length')
+
+if [ "$vuln_count" -gt 0 ]; then
+  echo "❌ $vuln_count unresolved high/critical vulnerabilities detected!"
+  exit 1
+else
+  echo "✅ No unresolved high/critical vulnerabilities."
+fi
 ```
 
-The shebang at the top of the script will ensure `uv` still manages the runtime
-environment transparently.
+Explanation:
+
+* `dependabot-check` outputs a JSON array of the remaining alerts.
+* `jq 'length'` returns the number of elements in that array.
+* The script exits with **non-zero** status when vulnerabilities remain, causing
+  the CI job to fail.
+
+If you don't have `jq` available, you could use a simple `grep` fallback:
+
+```bash
+if dependabot-check --dependabot "$alerts_json" --installed "$installed_json" | grep -q "\["; then
+  echo "vulnerabilities present"
+  exit 1
+fi
+```
+
+### 4. Generating `installed_versions.json`
+
+`dependabot-check` expects a simple JSON object mapping **package names → version strings**. Below are reference commands for the most common ecosystems. Each pipe uses `jq` to transform the tool's native JSON into the required flat object.
+
+> Feel free to adjust depth flags (`--depth`) or filters depending on your repo layout.
+
+#### a. Python (pip / uv)
+
+```bash
+# Using uv (preferred – falls back to pip under the hood)
+uv pip list --format=json \
+  | jq -r 'map({ (.name): .version }) | add' \
+  > installed_versions.json
+```
+
+#### b. npm (JavaScript / TypeScript)
+
+```bash
+# Capture only top-level production deps; omit --depth=0 to include transitive ones
+npm ls --json --depth=0 \
+  | jq '.dependencies | map_values(.version)' \
+  > installed_versions.json
+```
+
+If you're using **pnpm** or **yarn**:
+
+```bash
+pnpm list --json --depth=0 | jq '.[0].dependencies | map_values(.version)' > installed_versions.json
+```
+
+#### c. Go modules
+
+```bash
+# Collect all modules (main + dependencies)
+go list -m -json all \
+  | jq -s 'map({ (.Path): .Version }) | add' \
+  > installed_versions.json
+```
+
+Once you have the file, run the checker as shown earlier.
