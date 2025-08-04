@@ -9,14 +9,6 @@
 
 Filter Dependabot alerts to find high/critical open vulnerabilities that are still
 present in the currently installed package versions.
-
-Usage
------
-    uv run check_vulns.py --dependabot dependabot_output.json \
-                          --installed installed_versions.json \
-                          --output filtered.json
-
-If --output is omitted, the filtered list is printed to STDOUT as JSON.
 """
 
 from __future__ import annotations
@@ -56,8 +48,11 @@ def _normalize_specifier(raw_range: str) -> str:
     return raw_range.replace(" ", "")
 
 
-def _is_version_vulnerable(version_str: str, vulnerable_range: str) -> bool:
+def _is_version_vulnerable(version_str: str | None, vulnerable_range: str) -> bool:
     """Return True if *version_str* falls within *vulnerable_range*."""
+    if version_str is None:
+        return False
+
     try:
         version = Version(version_str)
     except InvalidVersion:
@@ -66,6 +61,52 @@ def _is_version_vulnerable(version_str: str, vulnerable_range: str) -> bool:
 
     spec = SpecifierSet(_normalize_specifier(vulnerable_range))
     return version in spec
+
+
+# ---------------------------------------------------------------------------
+# Helpers for automatic installed-version collection and Git repository detection
+# ---------------------------------------------------------------------------
+
+
+def _get_git_repo() -> str:
+    """Extract GitHub repository name from current Git repository.
+
+    Returns the repository in 'owner/name' format by parsing the Git remote origin URL.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        remote_url = result.stdout.strip()
+
+        # Handle different Git URL formats
+        # SSH: git@github.com:owner/repo.git
+        # HTTPS: https://github.com/owner/repo.git
+        if remote_url.startswith("git@github.com:"):
+            repo_part = remote_url.replace("git@github.com:", "")
+        elif "github.com" in remote_url:
+            repo_part = remote_url.split("github.com/")[-1]
+        else:
+            raise RuntimeError(f"Unsupported Git remote URL format: {remote_url}")
+
+        # Remove .git suffix if present
+        if repo_part.endswith(".git"):
+            repo_part = repo_part[:-4]
+
+        return repo_part
+
+    except subprocess.CalledProcessError:
+        raise RuntimeError(
+            "Failed to get Git remote origin URL. Make sure you're in a Git repository with a GitHub origin."
+        )
+    except FileNotFoundError:
+        raise RuntimeError(
+            "Git command not found. Make sure Git is installed and in your PATH."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +218,7 @@ def _collect_go_modules() -> Dict[str, str]:
 class AlertInfo:
     """Minimal subset of fields required from a Dependabot alert.
 
-    Only the attributes referenced by *filter_alerts* are included to keep the
+    Only the attributes referenced by *_filter_alerts* are included to keep the
     model purposely lightweight.
     """
 
@@ -209,87 +250,37 @@ class AlertInfo:
         )
 
 
-def filter_alerts(
-    alerts: List[AlertInfo], installed: Dict[str, str]
-) -> List[AlertInfo]:
+def _filter_alerts(alerts: List[AlertInfo]) -> List[AlertInfo]:
     """Return subset of *alerts* that match criteria defined in README."""
-    filtered: List[AlertInfo] = []
-
-    for alert in alerts:
-        # 1. Must be open
-        if alert.state != "open":
-            continue
-
-        # 2. Severity must be high or critical
-        if alert.severity is None or alert.severity.lower() not in SEVERITY_LEVELS:
-            continue
-
-        installed_version = installed.get(alert.package_name)
-        if installed_version is None:
-            # Package not installed — nothing to fix
-            continue
-
-        if not alert.vulnerable_version_range:
-            continue
-
-        if _is_version_vulnerable(installed_version, alert.vulnerable_version_range):
-            # Append original dict (if available) for continuity
-            filtered.append(alert)
-
-    return filtered
+    return [
+        alert
+        for alert in alerts
+        if alert.state == "open"
+        and (alert.severity and alert.severity.lower() in SEVERITY_LEVELS)
+    ]
 
 
-def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Filter Dependabot alerts.")
-    parser.add_argument(
-        "--dependabot",
-        type=Path,
-        help="Path to Dependabot alerts JSON file. If omitted, the script attempts to fetch alerts from GitHub.",
-    )
-    parser.add_argument(
-        "--installed",
-        type=Path,
-        help="Path to JSON file with installed package versions. If omitted, the script attempts to autodetect the current repository type (Python, Node, or Go) and gather installed versions automatically.",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        help="Optional output file. Prints to STDOUT if omitted.",
-    )
-    return parser.parse_args(argv)
+def _get_active_alerts(
+    alerts: List[AlertInfo], installed_packages: Dict[str, str]
+) -> List[AlertInfo]:
+    """Return packages that are impacted by the alerts."""
+    return [
+        alert
+        for alert in alerts
+        if _is_version_vulnerable(
+            installed_packages.get(alert.package_name), alert.vulnerable_version_range
+        )
+    ]
 
 
-def main(argv: List[str] | None = None) -> None:
-    args = parse_args(argv)
-
-    if args.dependabot:
-        alerts = [AlertInfo.from_raw(alert) for alert in _load_json(args.dependabot)]
-    else:
-        alerts = [
-            AlertInfo.from_raw(alert)
-            for alert in _fetch_dependabot_alerts_from_github()
-        ]
-
-    if args.installed:
-        installed = _load_json(args.installed)
-    else:
-        installed = _detect_and_collect_installed()
-
-    filtered = [alert.source for alert in filter_alerts(alerts, installed)]
-
-    if args.output:
-        args.output.write_text(json.dumps(filtered, indent=2))
-    else:
-        json.dump(filtered, sys.stdout, indent=2)
-        sys.stdout.write("\n")
-
-
-def _fetch_dependabot_alerts_from_github() -> list[dict[str, Any]]:
+def _fetch_dependabot_alerts_from_github(repo: str) -> list[dict[str, Any]]:
     """Fetch open Dependabot alerts using the GitHub API.
+
+    Args:
+        repo: Repository in `owner/name` format
 
     Environment variables required:
       GH_TOKEN – a GitHub personal access token with `security_events:read` scope
-      GH_REPO  – the repository in `owner/name` form
 
     The function first tries to invoke the `gh` CLI (preferred for simplicity).
     If `gh` is not available, it falls back to a direct HTTPS request using the
@@ -297,15 +288,12 @@ def _fetch_dependabot_alerts_from_github() -> list[dict[str, Any]]:
     terminates the program with a descriptive error.
     """
 
-    repo = os.environ.get("GH_REPO")
     token = os.environ.get("GH_TOKEN")
 
-    if not repo:
-        sys.exit("[error] GH_REPO environment variable not set (e.g. 'owner/repo').")
     if not token:
         sys.exit("[error] GH_TOKEN environment variable not set.")
 
-    # 1) Try GitHub CLI ------------------------------------------------------
+    # 1) Try GitHub CLI
     gh_cmd = shutil.which("gh")
     if gh_cmd is not None:
         try:
@@ -331,7 +319,7 @@ def _fetch_dependabot_alerts_from_github() -> list[dict[str, Any]]:
                 file=sys.stderr,
             )
 
-    # 2) Fallback to raw HTTP request ---------------------------------------
+    # 2) Fallback to raw HTTP request
     url = f"https://api.github.com/repos/{repo}/dependabot/alerts?state=open"
     headers = {
         "Authorization": f"token {token}",
@@ -345,6 +333,97 @@ def _fetch_dependabot_alerts_from_github() -> list[dict[str, Any]]:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         sys.exit(f"[error] Failed to fetch alerts via HTTPS: {exc}")
+
+
+def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Filter Dependabot alerts.")
+    parser.add_argument(
+        "--repo",
+        type=str,
+        help="GitHub repository in 'owner/name' format. If omitted, auto-detects from Git remote origin.",
+    )
+    parser.add_argument(
+        "--dependabot-alerts",
+        type=Path,
+        help="Path to Dependabot alerts JSON file. If omitted, the script attempts to fetch alerts from GitHub.",
+    )
+    parser.add_argument(
+        "--installed-packages",
+        type=Path,
+        help="Path to JSON file with installed package versions. If omitted, the script attempts to autodetect the current repository type (Python, Node, or Go) and gather installed versions automatically.",
+    )
+    parser.add_argument(
+        "--check-improvement",
+        action="store_true",
+        help="Success mode: exit with code 0 if installed packages have fewer vulnerabilities than total Dependabot alerts, 1 otherwise.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str] | None = None) -> None:
+    args = parse_args(argv)
+
+    # Determine repository
+    repo = args.repo
+    if not args.dependabot_alerts and not repo:
+        try:
+            repo = _get_git_repo()
+        except RuntimeError as e:
+            sys.exit(f"[error] {e}")
+
+    # Load alerts from file or fetch from GitHub
+    if args.dependabot_alerts:
+        alerts = [
+            AlertInfo.from_raw(alert) for alert in _load_json(args.dependabot_alerts)
+        ]
+    else:
+        alerts = [
+            AlertInfo.from_raw(alert)
+            for alert in _fetch_dependabot_alerts_from_github(repo)
+        ]
+    # Filter to get only high/critical open alerts
+    filtered_alerts = _filter_alerts(alerts)
+
+    # Load installed versions from file or autodetect
+    if args.installed_packages:
+        installed_packages = _load_json(args.installed_packages)
+    else:
+        installed_packages = _detect_and_collect_installed()
+    # Get packages that are impacted by the alerts
+    active_alerts = _get_active_alerts(filtered_alerts, installed_packages)
+
+    # Output active alerts in JSON format
+    filtered_alert_sources = [alert.source for alert in active_alerts]
+    json.dump(filtered_alert_sources, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+
+    # Check improvement mode
+    if args.check_improvement:
+        # Count total high/critical open alerts from Dependabot
+        dependabot_alerts_count = len(filtered_alerts)
+
+        # Count how many vulnerabilities are still present in the installed packages
+        active_alerts_count = len(active_alerts)
+
+        if active_alerts_count < dependabot_alerts_count:
+            print(
+                f"✅ Improvement detected: {dependabot_alerts_count} Dependabot alerts, only {active_alerts_count} affect installed packages"
+            )
+            sys.exit(0)
+        elif active_alerts_count == dependabot_alerts_count:
+            print(
+                f"⚠️  No improvement: all {dependabot_alerts_count} Dependabot alerts affect installed packages"
+            )
+            sys.exit(1)
+        else:
+            # This shouldn't happen in normal cases, but handle it
+            print(
+                f"❌ Unexpected: {active_alerts_count} vulnerable installed packages higher than {dependabot_alerts_count} Dependabot alerts"
+            )
+            sys.exit(1)
+    # Strict mode
+    else:
+        sys.exit(0 if len(filtered_alert_sources) == 0 else 1)
 
 
 if __name__ == "__main__":
