@@ -405,22 +405,7 @@ def main(argv: List[str] | None = None) -> None:
         # Count how many vulnerabilities are still present in the installed packages
         active_alerts_count = len(active_alerts)
 
-        if active_alerts_count < dependabot_alerts_count:
-            print(
-                f"✅ Improvement detected: {dependabot_alerts_count} Dependabot alerts, only {active_alerts_count} affect installed packages"
-            )
-            sys.exit(0)
-        elif active_alerts_count == dependabot_alerts_count:
-            print(
-                f"⚠️  No improvement: all {dependabot_alerts_count} Dependabot alerts affect installed packages"
-            )
-            sys.exit(1)
-        else:
-            # This shouldn't happen in normal cases, but handle it
-            print(
-                f"❌ Unexpected: {active_alerts_count} vulnerable installed packages higher than {dependabot_alerts_count} Dependabot alerts"
-            )
-            sys.exit(1)
+        sys.exit(0 if active_alerts_count < dependabot_alerts_count else 1)
     # Strict mode
     else:
         sys.exit(0 if len(filtered_alert_sources) == 0 else 1)
