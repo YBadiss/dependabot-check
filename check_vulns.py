@@ -401,11 +401,11 @@ def main(argv: List[str] | None = None) -> None:
     if args.check_improvement:
         # Count total high/critical open alerts from Dependabot
         dependabot_alerts_count = len(filtered_alerts)
-
         # Count how many vulnerabilities are still present in the installed packages
         active_alerts_count = len(active_alerts)
+        has_improved = active_alerts_count < dependabot_alerts_count
 
-        sys.exit(0 if active_alerts_count < dependabot_alerts_count else 1)
+        sys.exit(0 if (has_improved or dependabot_alerts_count == 0) else 1)
     # Strict mode
     else:
         sys.exit(0 if len(filtered_alert_sources) == 0 else 1)
